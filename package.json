@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "openai": "^7.17.0"
+    "openai": "^7.17.0",
+    "ws": "^8.18.0"
   }
 }
