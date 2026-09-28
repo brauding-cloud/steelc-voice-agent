@@ -1,5 +1,6 @@
 import express from "express";
 import OpenAI from "openai";
+import WebSocket from "ws";
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -9,27 +10,94 @@ const client = new OpenAI({
   webhookSecret: process.env.OPENAI_WEBHOOK_SECRET,
 });
 
-// Проверка работы сервера
 app.get("/", (req, res) => {
   res.status(200).send("STEELC Voice Agent is running");
 });
 
-// Webhook OpenAI
+function attachSideband(sessionId) {
+  const url =
+    `wss://api.openai.com/v1/live/sessions/${sessionId}/attach`;
+
+  const ws = new WebSocket(url, {
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+  });
+
+  ws.on("open", () => {
+    console.log("Sideband connected:", sessionId);
+
+    // GPT-Live must speak first instead of waiting for the caller.
+    ws.send(
+      JSON.stringify({
+        type: "session.instructions.append",
+        event_id: `greeting_${Date.now()}`,
+        delegation_id: null,
+        content: `
+Greet the caller now.
+
+Speak first immediately. Do not wait for the caller to speak.
+
+For this initial test, greet in English.
+
+Say only:
+"Hello, STEELC. How can we help you?"
+
+After the greeting, stop speaking and listen to the caller.
+
+If the caller then speaks German, immediately continue in German.
+If the caller speaks English, continue in English.
+        `.trim(),
+      })
+    );
+
+    console.log("Greeting instruction sent:", sessionId);
+  });
+
+  ws.on("message", (data) => {
+    try {
+      const event = JSON.parse(data.toString());
+
+      if (event.type === "session.instructions.appended") {
+        console.log("Greeting instruction accepted:", sessionId);
+      }
+
+      if (event.type === "error") {
+        console.error("Sideband OpenAI error:", event);
+      }
+    } catch (error) {
+      console.error("Sideband message error:", error);
+    }
+  });
+
+  ws.on("error", (error) => {
+    console.error("Sideband WebSocket error:", error);
+  });
+
+  ws.on("close", (code, reason) => {
+    console.log(
+      "Sideband closed:",
+      sessionId,
+      code,
+      reason.toString()
+    );
+  });
+
+  return ws;
+}
+
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
-      // Проверяем подпись webhook
       const event = await client.webhooks.unwrap(
         req.body.toString("utf8"),
         req.headers
       );
 
-      // OpenAI должен быстро получить 200 OK
       res.sendStatus(200);
 
-      // Нас интересуют только входящие Live-звонки
       if (event.type !== "live.transport.incoming") {
         return;
       }
@@ -38,7 +106,10 @@ app.post(
         event.data?.type !== "sip" ||
         !event.data?.session_id
       ) {
-        console.log("Unsupported incoming transport:", event.data);
+        console.log(
+          "Unsupported incoming transport:",
+          event.data
+        );
         return;
       }
 
@@ -46,67 +117,37 @@ app.post(
 
       console.log("Incoming STEELC SIP call:", sessionId);
 
-      // Принимаем входящий звонок
       await client.live.sessions.accept(sessionId, {
         session: {
           type: "live",
           model: "gpt-live-1",
 
           instructions: `
-You are handling the incoming telephone line for STEELC.
+You handle incoming telephone calls for STEELC.
 
-ROLE
+You are acting only as telephone reception before transferring
+the caller to a human employee.
 
-You are a telephone receptionist.
-
-Your only job before transfer is to:
-1. greet the caller,
-2. understand briefly why they are calling,
-3. collect only essential information if necessary,
-4. tell the caller that you will connect them with the appropriate employee.
-
-Do not conduct the business conversation yourself.
+Keep all responses short, natural and professional.
 
 LANGUAGE
 
-Speak in the language used by the caller.
+Use the language spoken by the caller.
 
 German and English are the primary languages.
 
 If the caller speaks German, respond in German.
-
 If the caller speaks English, respond in English.
 
-If the caller changes language during the conversation,
-immediately continue in that language.
+If the caller changes language, immediately change with them.
 
-If the language is initially unclear, use English.
+CALL HANDLING
 
-OPENING
-
-Keep the opening extremely short and natural.
-
-German:
-"Guten Tag, STEELC. Wie können wir Ihnen helfen?"
-
-English:
-"Hello, STEELC. How can we help you?"
-
-Do not introduce yourself as a digital assistant in the greeting.
-
-Do not give a presentation about STEELC.
-
-Do not automatically explain what STEELC manufactures.
-
-CALLER REQUEST
-
-Listen carefully to the caller.
-
-Determine the reason for the call.
+Briefly determine why the person is calling.
 
 Correctly understand:
 - RFQ numbers
-- quotation requests
+- quotations
 - drawings
 - orders
 - CNC turning
@@ -114,52 +155,33 @@ Correctly understand:
 - materials
 - tolerances
 - DIN and EN terminology
-- technical manufacturing terminology
 
-If necessary, you may briefly ask for:
-- caller name
-- company name
+If necessary, ask briefly for:
 - RFQ number
-- a short clarification of the reason for the call
+- company name
+- caller name
 
-Do not ask unnecessary questions.
-
-RESTRICTIONS
+Do not conduct the business conversation yourself.
 
 Do not discuss technical matters in detail.
-
 Do not negotiate.
-
 Do not quote prices.
-
 Do not promise delivery dates.
-
 Do not confirm orders.
-
-Do not make commercial or technical decisions.
-
+Do not make decisions for STEELC.
 Do not invent information.
 
-TRANSFER
+As soon as you understand the reason for the call,
+tell the caller that you will connect them with the
+appropriate employee.
 
-As soon as you understand why the person is calling,
-stop asking questions and tell them you will connect
-them with the appropriate employee.
-
-If speaking German, say:
-
+German:
 "Vielen Dank. Einen Moment bitte, ich verbinde Sie mit dem zuständigen Mitarbeiter."
 
-If speaking English, say:
-
+English:
 "Thank you. One moment please, I'll connect you with the appropriate colleague."
 
-After saying this, do not continue discussing the customer's
-business request.
-
-Keep responses short, polite and professional.
-
-Sound like a normal professional telephone reception.
+After saying this, do not continue discussing the business matter.
           `.trim(),
 
           audio: {
@@ -171,6 +193,10 @@ Sound like a normal professional telephone reception.
       });
 
       console.log("Call accepted:", sessionId);
+
+      // Attach only after OpenAI has accepted the SIP call.
+      attachSideband(sessionId);
+
     } catch (error) {
       console.error("Webhook/call error:", error);
 
@@ -182,5 +208,7 @@ Sound like a normal professional telephone reception.
 );
 
 app.listen(port, "0.0.0.0", () => {
-  console.log(`STEELC Voice Agent listening on port ${port}`);
+  console.log(
+    `STEELC Voice Agent listening on port ${port}`
+  );
 });
