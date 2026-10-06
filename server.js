@@ -515,76 +515,6 @@ const liveTools = [
 /* Function-call detection                             */
 /* -------------------------------------------------- */
 
-function collectFunctionCalls(
-  value,
-  found = []
-) {
-  if (!value) {
-    return found;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      collectFunctionCalls(
-        item,
-        found
-      );
-    }
-
-    return found;
-  }
-
-  if (
-    typeof value !== "object"
-  ) {
-    return found;
-  }
-
-  const name =
-    typeof value.name === "string"
-      ? value.name
-      : null;
-
-  const isKnownFunction =
-    name === "handoff_to_andrey" ||
-    name === "connect_customer";
-
-  const hasArguments =
-    Object.prototype.hasOwnProperty.call(
-      value,
-      "arguments"
-    );
-
-  const looksLikeFunctionCall =
-    value.type === "function_call" ||
-    value.type === "tool_call" ||
-    Boolean(value.call_id);
-
-  if (
-    isKnownFunction &&
-    hasArguments &&
-    looksLikeFunctionCall
-  ) {
-    found.push(value);
-  }
-
-  for (
-    const child of Object.values(value)
-  ) {
-    if (
-      child &&
-      typeof child === "object"
-    ) {
-      collectFunctionCalls(
-        child,
-        found
-      );
-    }
-  }
-
-  return found;
-}
-
 function handleFunctionCall(
   session,
   call
@@ -629,10 +559,10 @@ function handleFunctionCall(
     if (
       session.handoffRequested
     ) {
-      return;
+      return { status: "already_requested", action: "handoff_to_andrey" };
     }
 
-    session.handoffRequested = true;
+    // Mark the action only after sending it to the controller.
 
     session.language =
       args.language === "en"
@@ -644,7 +574,7 @@ function handleFunctionCall(
       session.sessionId
     );
 
-    sendController({
+    const sent = sendController({
       type: "reception_ready",
       sessionId:
         session.sessionId,
@@ -668,7 +598,8 @@ function handleFunctionCall(
         args.summary || "",
     });
 
-    return;
+    session.handoffRequested = sent;
+    return { status: sent ? "requested" : "failed", action: "handoff_to_andrey" };
   }
 
   if (
@@ -678,21 +609,26 @@ function handleFunctionCall(
     if (
       session.connectRequested
     ) {
-      return;
+      return { status: "already_requested", action: "connect_customer" };
     }
 
-    session.connectRequested = true;
+    if (session.mode !== "PRIVATE_BRIEFING") {
+      return { status: "rejected", reason: "Private briefing is not active" };
+    }
 
     console.log(
       "Andrey requested connection:",
       session.sessionId
     );
 
-    sendController({
+    const sent = sendController({
       type: "connect_customer",
       sessionId:
         session.sessionId,
     });
+
+    session.connectRequested = sent;
+    return { status: sent ? "requested" : "failed", action: "connect_customer" };
   }
 }
 
@@ -727,6 +663,12 @@ function attachSideband(
     handledCalls: new Set(),
     handoffRequested: false,
     connectRequested: false,
+    toolsUpdateId: `tools_${sessionId}`,
+    toolsReady: false,
+    greetingInstruction: null,
+    pendingToolResponses: new Set(),
+    responseIds: new Map(),
+    returnedToolCalls: new Set(),
   };
 
   sessions.set(
@@ -775,10 +717,21 @@ If the caller speaks German, immediately continue in German.
 If the caller speaks English, continue in English.
 `.trim();
 
-      appendInstructions(
-        session,
-        greetingInstruction
-      );
+      session.greetingInstruction = greetingInstruction;
+      ws.send(JSON.stringify({
+        type: "session.update",
+        event_id: session.toolsUpdateId,
+        session: {
+          delegation: {
+            type: "responses",
+            responses: {
+              tools: liveTools,
+              tool_choice: "auto",
+              parallel_tool_calls: false,
+            },
+          },
+        },
+      }));
     }
   );
 
@@ -795,16 +748,55 @@ If the caller speaks English, continue in English.
         return;
       }
 
-      const calls =
-        collectFunctionCalls(
-          event
-        );
+      if (event.type === "session.updated" &&
+          event.client_event_id === session.toolsUpdateId &&
+          !session.toolsReady) {
+        session.toolsReady = true;
+        console.log("Live tools configured:", sessionId);
+        appendInstructions(session, session.greetingInstruction);
+      }
 
-      for (const call of calls) {
-        handleFunctionCall(
-          session,
-          call
-        );
+      // Live wraps the delegated Responses stream in response.event.
+      // Execute only completed items, never partial streamed arguments.
+      if (event.type === "response.event") {
+        const nested = event.event;
+        if (nested?.type === "response.created" && nested.response?.id) {
+          session.responseIds.set(event.delegation_id, nested.response.id);
+        }
+        const responseKey = nested?.response_id ||
+          nested?.response?.id || session.responseIds.get(event.delegation_id) ||
+          event.delegation_id;
+        if (nested?.type === "response.output_item.done" &&
+            nested.item?.type === "function_call" &&
+            nested.item.call_id &&
+            !session.returnedToolCalls.has(nested.item.call_id)) {
+          const call = nested.item;
+          const result = handleFunctionCall(session, call) ||
+            { status: "rejected", reason: "Unknown or invalid tool call" };
+          ws.send(JSON.stringify({
+            type: "response.item.create",
+            event_id: `result_${call.call_id}`,
+            item: {
+              type: "function_call_output",
+              call_id: call.call_id,
+              output: JSON.stringify(result),
+            },
+          }));
+          session.returnedToolCalls.add(call.call_id);
+          session.pendingToolResponses.add(responseKey);
+        }
+        if (nested?.type === "response.completed" &&
+            session.pendingToolResponses.delete(responseKey)) {
+          ws.send(JSON.stringify({
+            type: "response.create",
+            event_id: `continue_${responseKey}`,
+          }));
+        }
+        if (nested?.type === "response.failed" ||
+            nested?.type === "response.incomplete") {
+          session.pendingToolResponses.delete(responseKey);
+          console.error("Live backend response failed:", JSON.stringify(nested));
+        }
       }
 
       if (
@@ -1025,9 +1017,24 @@ The private briefing is with Andrey, not with the external caller.
 You retain the entire earlier caller conversation and may answer Andrey's questions about it.
 `.trim(),
 
-            tools:
-              liveTools,
-
+            // Delegation mode must be selected at startup. Tools are
+            // registered separately through the trusted sideband.
+            delegation: {
+              type: "responses",
+              responses: {
+                model: process.env.OPENAI_LIVE_BACKEND_MODEL || "gpt-6-luna",
+                instructions: `
+Support the STEELC receptionist and its private briefing with Andrey.
+Follow the current task and conversation context supplied by the Live model.
+Use handoff_to_andrey once the caller has provided enough information.
+Use only facts actually supplied by the caller; use empty strings for unknown fields.
+Use connect_customer only when Andrey explicitly requests connection during
+PRIVATE BRIEFING. Never connect the customer during reception or confirmation.
+After a successful handoff, wait for the server's mode change.
+Do not negotiate, quote prices, promise dates, or invent information.
+`.trim(),
+              },
+            },
 
             audio: {
               output: {
