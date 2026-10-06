@@ -347,6 +347,7 @@ Do not translate.
 
     clearTimeout(session.greetingTimer);
     session.mode = "PRIVATE_BRIEFING";
+    session.privateOutputTranscript = "";
     updateModeTools(session);
 
     appendInstructions(
@@ -866,6 +867,7 @@ function attachSideband(
     activeResponses: new Set(),
     pendingHandoff: null,
     outputTranscript: "",
+    privateOutputTranscript: "",
     transferAnnouncementHeard: false,
     transferAnnouncementAt: 0,
     greetingInstruction: null,
@@ -972,6 +974,23 @@ If the caller speaks English, continue in English.
         session.outputTranscript = (session.outputTranscript + event.delta).slice(-4000);
         if ( /\b(?:I(?:['’]ll| will| am going to)|let me)\s+connect\s+you\s+(?:with|to)\s+(?:the\s+|an?\s+)?(?:appropriate\s+|responsible\s+)?(?:colleague|Andrey|employee|team|person)\b|\bich\s+verbinde\s+Sie\s+mit\s+(?:dem\s+|einem\s+)?(?:zuständigen\s+)?(?:Mitarbeiter|Kollegen|Andrey)\b/i.test(session.outputTranscript)) {
           session.transferAnnouncementHeard = true;
+        }
+      }
+      // Accumulate Live fragments so a connect phrase split across deltas is detected.
+      // Share connectRequested with the tool path to send the command only once.
+      if (event.type === "session.output_transcript.delta" &&
+          session.mode === "PRIVATE_BRIEFING" && !session.connectRequested &&
+          typeof event.delta === "string") {
+        session.privateOutputTranscript =
+          (session.privateOutputTranscript + event.delta).slice(-4000);
+        if (/(?:^|[^а-яё])(?:соединяю|соединю|подключаю|подключу)(?=$|[^а-яё])/i
+            .test(session.privateOutputTranscript)) {
+          console.log("Private connect phrase detected:", session.sessionId);
+          const sent = sendController({
+            type: "connect_customer",
+            sessionId: session.sessionId,
+          });
+          session.connectRequested = sent;
         }
       }
       if (event.type === "session.output_transcript.delta" ||
