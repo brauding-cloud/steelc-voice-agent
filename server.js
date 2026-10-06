@@ -976,23 +976,6 @@ If the caller speaks English, continue in English.
           session.transferAnnouncementHeard = true;
         }
       }
-      // Accumulate Live fragments so a connect phrase split across deltas is detected.
-      // Share connectRequested with the tool path to send the command only once.
-      if (event.type === "session.output_transcript.delta" &&
-          session.mode === "PRIVATE_BRIEFING" && !session.connectRequested &&
-          typeof event.delta === "string") {
-        session.privateOutputTranscript =
-          (session.privateOutputTranscript + event.delta).slice(-4000);
-        if (/(?:^|[^а-яё])(?:соединяю|соединю|подключаю|подключу)(?=$|[^а-яё])/i
-            .test(session.privateOutputTranscript)) {
-          console.log("Private connect phrase detected:", session.sessionId);
-          const sent = sendController({
-            type: "connect_customer",
-            sessionId: session.sessionId,
-          });
-          session.connectRequested = sent;
-        }
-      }
       if (event.type === "session.output_transcript.delta" ||
           event.type === "session.output_audio.delta") {
         session.lastOutputAt = Date.now();
