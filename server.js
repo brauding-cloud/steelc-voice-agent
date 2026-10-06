@@ -25,6 +25,8 @@ const eventId = (prefix) => `${prefix}_${Date.now()}_${++eventSequence}`;
 // never interpret a fixed number of seconds as sufficient caller information.
 const RECEPTION_PAUSE_MS = 1800;
 const RECEPTION_OUTPUT_PAUSE_MS = 900;
+// Allow the short connection announcement, then hand off even without captions.
+const RECEPTION_HANDOFF_WAIT_MS = 4500;
 const RECEPTION_RETRY_MS = 10000;
 
 /* -------------------------------------------------- */
@@ -592,15 +594,23 @@ function updateModeTools(session) {
 }
 
 function flushPendingHandoff(session) {
-  if (!session.pendingHandoff || session.handoffRequested ||
-      session.mode !== "RECEPTION") return false;
-  // Live sideband has no playback-done event. Require a complete transfer
-  // sentence and quiet output; never treat a timeout as proof of speech.
-  if (!session.transferAnnouncementHeard ||
-      Date.now() - session.lastOutputAt < RECEPTION_OUTPUT_PAUSE_MS ||
-      Date.now() - session.lastCallerAt < RECEPTION_PAUSE_MS) return false;
+  if (sessions.get(session.sessionId) !== session || !session.pendingHandoff ||
+      session.handoffRequested || session.mode !== "RECEPTION") return false;
+  const now = Date.now();
+  const announcementTimedOut = session.handoffDeadlineAt > 0 &&
+    now >= session.handoffDeadlineAt;
+  // Captions can permit an earlier handoff after quiet output. The deadline
+  // is only a grace period, not proof of speech, and never requires Live output.
+  if (!announcementTimedOut && (!session.transferAnnouncementHeard ||
+      now - session.lastOutputAt < RECEPTION_OUTPUT_PAUSE_MS ||
+      now - session.lastCallerAt < RECEPTION_PAUSE_MS)) return false;
   const sent = sendController(session.pendingHandoff);
   if (sent) {
+    clearTimeout(session.handoffTimer);
+    session.handoffTimer = null;
+    session.handoffDeadlineAt = 0;
+    console.log("Reception handoff sent:", session.sessionId,
+      announcementTimedOut ? "announcement grace period elapsed" : "announcement transcript received");
     session.pendingHandoff = null;
     session.handoffRequested = true;
     session.mode = "WAITING_FOR_ANDREY";
@@ -623,6 +633,16 @@ function queueReceptionHandoff(session, facts) {
     company: text(facts.company), rfq: text(facts.rfq),
     reason: text(facts.reason), summary: text(facts.summary),
   };
+  if (!session.handoffDeadlineAt) {
+    session.handoffDeadlineAt = Date.now() + RECEPTION_HANDOFF_WAIT_MS;
+    session.handoffTimer = setTimeout(() => {
+      session.handoffTimer = null;
+      // An unavailable controller leaves the command queued for the watchdog.
+      flushPendingHandoff(session);
+    }, RECEPTION_HANDOFF_WAIT_MS);
+    session.handoffTimer.unref?.();
+    console.log("Reception handoff queued:", session.sessionId);
+  }
   if (!session.transferAnnouncementHeard && !session.transferAnnouncementAt) {
     session.transferAnnouncementAt = Date.now();
     // Reset captions so a fragment from an earlier sentence cannot match.
@@ -881,6 +901,8 @@ function attachSideband(
     greetingStarted: false,
     activeResponses: new Set(),
     pendingHandoff: null,
+    handoffDeadlineAt: 0,
+    handoffTimer: null,
     outputTranscript: "",
     transferAnnouncementHeard: false,
     transferAnnouncementAt: 0,
@@ -1083,6 +1105,9 @@ If the caller speaks English, continue in English.
 
       clearInterval(session.receptionWatchdog);
       clearTimeout(session.greetingTimer);
+      clearTimeout(session.handoffTimer);
+      session.handoffTimer = null;
+      session.handoffDeadlineAt = 0;
       session.pendingHandoff = null;
       sessions.delete(sessionId);
     }
