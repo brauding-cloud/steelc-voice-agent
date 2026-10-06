@@ -24,9 +24,6 @@ const eventId = (prefix) => `${prefix}_${Date.now()}_${++eventSequence}`;
 // Live transcripts are fragments, not completed user turns. Debounce them;
 // never interpret a fixed number of seconds as sufficient caller information.
 const RECEPTION_PAUSE_MS = 1800;
-const RECEPTION_OUTPUT_PAUSE_MS = 900;
-// Allow the short connection announcement, then hand off even without captions.
-const RECEPTION_HANDOFF_WAIT_MS = 4500;
 const RECEPTION_RETRY_MS = 10000;
 
 /* -------------------------------------------------- */
@@ -447,7 +444,6 @@ Do not discuss prices or promise delivery dates.
       session.mode = "FINISHED";
       session.pendingHandoff = null;
       clearInterval(session.receptionWatchdog);
-      clearTimeout(session.greetingTimer);
     }
     return;
   }
@@ -594,23 +590,11 @@ function updateModeTools(session) {
 }
 
 function flushPendingHandoff(session) {
-  if (sessions.get(session.sessionId) !== session || !session.pendingHandoff ||
-      session.handoffRequested || session.mode !== "RECEPTION") return false;
-  const now = Date.now();
-  const announcementTimedOut = session.handoffDeadlineAt > 0 &&
-    now >= session.handoffDeadlineAt;
-  // Captions can permit an earlier handoff after quiet output. The deadline
-  // is only a grace period, not proof of speech, and never requires Live output.
-  if (!announcementTimedOut && (!session.transferAnnouncementHeard ||
-      now - session.lastOutputAt < RECEPTION_OUTPUT_PAUSE_MS ||
-      now - session.lastCallerAt < RECEPTION_PAUSE_MS)) return false;
+  if (!session.pendingHandoff || session.handoffRequested ||
+      session.mode !== "RECEPTION") return false;
+  // Readiness owns the transfer. Speech and caption timing cannot block it.
   const sent = sendController(session.pendingHandoff);
   if (sent) {
-    clearTimeout(session.handoffTimer);
-    session.handoffTimer = null;
-    session.handoffDeadlineAt = 0;
-    console.log("Reception handoff sent:", session.sessionId,
-      announcementTimedOut ? "announcement grace period elapsed" : "announcement transcript received");
     session.pendingHandoff = null;
     session.handoffRequested = true;
     session.mode = "WAITING_FOR_ANDREY";
@@ -633,25 +617,19 @@ function queueReceptionHandoff(session, facts) {
     company: text(facts.company), rfq: text(facts.rfq),
     reason: text(facts.reason), summary: text(facts.summary),
   };
-  if (!session.handoffDeadlineAt) {
-    session.handoffDeadlineAt = Date.now() + RECEPTION_HANDOFF_WAIT_MS;
-    session.handoffTimer = setTimeout(() => {
-      session.handoffTimer = null;
-      // An unavailable controller leaves the command queued for the watchdog.
-      flushPendingHandoff(session);
-    }, RECEPTION_HANDOFF_WAIT_MS);
-    session.handoffTimer.unref?.();
-    console.log("Reception handoff queued:", session.sessionId);
-  }
+  // Send the controller command first; optional speech cannot delay handoff.
+  const sent = flushPendingHandoff(session);
   if (!session.transferAnnouncementHeard && !session.transferAnnouncementAt) {
     session.transferAnnouncementAt = Date.now();
-    // Reset captions so a fragment from an earlier sentence cannot match.
-    session.outputTranscript = "";
-    appendInstructions(session, session.language === "de"
-      ? 'Say now: "Vielen Dank. Einen Moment bitte, ich verbinde Sie mit dem zuständigen Mitarbeiter." Then stop speaking and wait for the server mode change. Do not delegate another handoff.'
-      : 'Say now: "Thank you. One moment please, I will connect you with the appropriate colleague." Then stop speaking and wait for the server mode change. Do not delegate another handoff.');
+    sendSideband(session, {
+      type: "session.commentary.append", event_id: eventId("transfer_speech"),
+      delegation_id: null,
+      content: session.language === "de"
+        ? "Einen Moment bitte, ich verbinde Sie mit dem zuständigen Mitarbeiter."
+        : "Please wait, I will connect you with the appropriate colleague.",
+    });
   }
-  return flushPendingHandoff(session);
+  return sent;
 }
 
 const RECEPTION_CHECK_SCHEMA = {
@@ -678,7 +656,6 @@ async function checkReception(session) {
   if (!session.callerTranscript.trim() || session.checkInFlight) return;
   const now = Date.now();
   if (now - session.lastCallerAt < RECEPTION_PAUSE_MS ||
-      now - session.lastOutputAt < RECEPTION_OUTPUT_PAUSE_MS ||
       (session.checkedRevision === session.transcriptRevision &&
        (!session.checkNeedsRetry || now - session.lastCheckAt < RECEPTION_RETRY_MS))) return;
   const revision = session.transcriptRevision;
@@ -730,29 +707,16 @@ meaningful reason is known; otherwise describe the missing clarification.`,
 
 function startGreeting(session) {
   if (session.greetingStarted || session.mode !== "RECEPTION") return;
-  session.greetingStarted = true;
-  session.greetingEventId = eventId("greeting");
-  sendSideband(session, {
-    type: "session.instructions.append", event_id: session.greetingEventId,
-    delegation_id: null, content: session.greetingInstruction,
+  session.greetingEventId = eventId("greeting_speech");
+  const sent = sendSideband(session, {
+    type: "session.commentary.append", event_id: session.greetingEventId,
+    delegation_id: null,
+    content: session.initialLanguage === "de"
+      ? "Guten Tag, STEELC. Wie können wir Ihnen helfen?"
+      : "Hello, STEELC. How can we help you?",
   });
-  console.log("Greeting requested:", session.sessionId);
-  // Speech is requested through Live steering, not response.create (backend).
-  // If neither party speaks, explicitly enqueue speakable commentary once.
-  session.greetingTimer = setTimeout(() => {
-    if (sessions.get(session.sessionId) !== session || session.mode !== "RECEPTION" ||
-        session.lastCallerAt || session.lastOutputAt) return;
-    session.greetingFallbackId = eventId("greeting_speech");
-    sendSideband(session, {
-      type: "session.commentary.append", event_id: session.greetingFallbackId,
-      delegation_id: null,
-      content: session.initialLanguage === "de"
-        ? "Guten Tag, STEELC. Wie können wir Ihnen helfen?"
-        : "Hello, STEELC. How can we help you?",
-    });
-    console.log("Greeting speech fallback requested:", session.sessionId);
-  }, 4000);
-  session.greetingTimer.unref?.();
+  session.greetingStarted = sent;
+  if (sent) console.log("Greeting speech requested immediately:", session.sessionId);
 }
 
 /* -------------------------------------------------- */
@@ -901,8 +865,6 @@ function attachSideband(
     greetingStarted: false,
     activeResponses: new Set(),
     pendingHandoff: null,
-    handoffDeadlineAt: 0,
-    handoffTimer: null,
     outputTranscript: "",
     transferAnnouncementHeard: false,
     transferAnnouncementAt: 0,
@@ -958,6 +920,8 @@ If the caller speaks English, continue in English.
 `.trim();
 
       session.greetingInstruction = greetingInstruction;
+      // The attached SIP session is already running when the socket opens.
+      startGreeting(session);
       ws.send(JSON.stringify({
         type: "session.update",
         event_id: session.toolsUpdateId,
@@ -1019,7 +983,7 @@ If the caller speaks English, continue in English.
         console.log("Greeting instructions accepted:", sessionId);
       }
       if (event.type === "session.commentary.appended" &&
-          event.client_event_id === session.greetingFallbackId) {
+          event.client_event_id === session.greetingEventId) {
         console.log("Greeting speech request accepted:", sessionId);
       }
 
@@ -1104,10 +1068,6 @@ If the caller speaks English, continue in English.
       );
 
       clearInterval(session.receptionWatchdog);
-      clearTimeout(session.greetingTimer);
-      clearTimeout(session.handoffTimer);
-      session.handoffTimer = null;
-      session.handoffDeadlineAt = 0;
       session.pendingHandoff = null;
       sessions.delete(sessionId);
     }
@@ -1295,7 +1255,9 @@ If speaking German, say:
 If speaking English, say:
 "Thank you. One moment please, I'll connect you with the appropriate colleague."
 
-Say the transfer sentence BEFORE invoking the transfer tool.
+The server sends the transfer command as soon as readiness is confirmed.
+The transfer sentence may be spoken while that command is being sent.
+Never wait for speech or transcript completion before requesting handoff.
 
 Immediately after saying it, call handoff_to_andrey exactly once.
 
