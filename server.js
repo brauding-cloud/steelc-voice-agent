@@ -392,11 +392,10 @@ When Andrey says any clear equivalent of:
 "подключай клиента",
 "можно соединять",
 
-say:
+call the function connect_customer exactly once.
 
-"Соединяю."
-
-Then immediately call the function connect_customer exactly once.
+Do not say "Соединяю." yourself.
+The application will say it and will switch the call only after that announcement has finished.
 
 Do not begin translating yourself.
 The dedicated translation system will take over after the tool call.
@@ -720,6 +719,75 @@ function startGreeting(session) {
   if (sent) console.log("Greeting speech requested immediately:", session.sessionId);
 }
 
+function beginPrivateConnect(session) {
+  if (
+    session.mode !== "PRIVATE_BRIEFING" ||
+    session.connectRequested ||
+    session.connectSequenceStarted
+  ) {
+    return false;
+  }
+
+  session.connectSequenceStarted = true;
+  session.connectAnnouncementRequestedAt = Date.now();
+  session.connectAnnouncementAudioSeen = false;
+  session.connectAnnouncementEventId = eventId("private_connect_speech");
+
+  const spoken = sendSideband(session, {
+    type: "session.commentary.append",
+    event_id: session.connectAnnouncementEventId,
+    delegation_id: null,
+    content: "Соединяю.",
+  });
+
+  if (!spoken) {
+    session.connectSequenceStarted = false;
+    return false;
+  }
+
+  console.log("Private connect announcement requested:", session.sessionId);
+
+  session.connectTimer = setInterval(() => {
+    if (session.mode !== "PRIVATE_BRIEFING" || session.connectRequested) {
+      clearInterval(session.connectTimer);
+      session.connectTimer = null;
+      return;
+    }
+
+    const elapsed = Date.now() - session.connectAnnouncementRequestedAt;
+    const quietFor = Date.now() - session.lastOutputAt;
+
+    if (
+      (session.connectAnnouncementAudioSeen && quietFor >= 600) ||
+      elapsed >= 3000
+    ) {
+      clearInterval(session.connectTimer);
+      session.connectTimer = null;
+
+      const sent = sendController({
+        type: "connect_customer",
+        sessionId: session.sessionId,
+      });
+
+      session.connectRequested = sent;
+
+      console.log(
+        sent
+          ? "Private connect command sent after announcement"
+          : "Private connect command failed",
+        session.sessionId
+      );
+
+      if (!sent) {
+        session.connectSequenceStarted = false;
+      }
+    }
+  }, 100);
+
+  session.connectTimer.unref?.();
+  return true;
+}
+
 /* -------------------------------------------------- */
 /* Function-call detection                             */
 /* -------------------------------------------------- */
@@ -796,7 +864,8 @@ function handleFunctionCall(
     "connect_customer"
   ) {
     if (
-      session.connectRequested
+      session.connectRequested ||
+      session.connectSequenceStarted
     ) {
       return { status: "already_requested", action: "connect_customer" };
     }
@@ -810,14 +879,12 @@ function handleFunctionCall(
       session.sessionId
     );
 
-    const sent = sendController({
-      type: "connect_customer",
-      sessionId:
-        session.sessionId,
-    });
+    const started = beginPrivateConnect(session);
 
-    session.connectRequested = sent;
-    return { status: sent ? "requested" : "failed", action: "connect_customer" };
+    return {
+      status: started ? "announcement_started" : "failed",
+      action: "connect_customer",
+    };
   }
 }
 
@@ -852,6 +919,12 @@ function attachSideband(
     handledCalls: new Set(),
     handoffRequested: false,
     connectRequested: false,
+    connectSequenceStarted: false,
+    connectAnnouncementRequestedAt: 0,
+    connectAnnouncementAudioSeen: false,
+    connectAnnouncementEventId: null,
+    connectTimer: null,
+    privateInputTranscript: "",
     toolsUpdateId: `tools_${sessionId}`,
     toolsReady: false,
     callerTranscript: "",
@@ -969,6 +1042,21 @@ If the caller speaks English, continue in English.
         session.transcriptRevision++;
         session.lastCallerAt = Date.now();
       }
+
+      if (event.type === "session.input_transcript.delta" &&
+          session.mode === "PRIVATE_BRIEFING" &&
+          !session.connectRequested &&
+          !session.connectSequenceStarted &&
+          typeof event.delta === "string") {
+        session.privateInputTranscript =
+          (session.privateInputTranscript + event.delta).slice(-600);
+
+        if (/(?:^|[^а-яё])(?:соединяй|соединяйте|соедините|подключай|подключи|подключите|можно\s+соединять)(?=$|[^а-яё])/i
+            .test(session.privateInputTranscript)) {
+          console.log("Private connect command heard:", session.sessionId);
+          beginPrivateConnect(session);
+        }
+      }
       if (event.type === "session.output_transcript.delta" &&
           session.mode === "RECEPTION" && typeof event.delta === "string") {
         session.outputTranscript = (session.outputTranscript + event.delta).slice(-4000);
@@ -976,6 +1064,13 @@ If the caller speaks English, continue in English.
           session.transferAnnouncementHeard = true;
         }
       }
+      if (event.type === "session.output_audio.delta" &&
+          session.mode === "PRIVATE_BRIEFING" &&
+          session.connectSequenceStarted &&
+          !session.connectRequested) {
+        session.connectAnnouncementAudioSeen = true;
+      }
+
       if (event.type === "session.output_transcript.delta" ||
           event.type === "session.output_audio.delta") {
         session.lastOutputAt = Date.now();
