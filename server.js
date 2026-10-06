@@ -1028,8 +1028,6 @@ You retain the entire earlier caller conversation and may answer Andrey's questi
             tools:
               liveTools,
 
-            tool_choice:
-              "auto",
 
             audio: {
               output: {
